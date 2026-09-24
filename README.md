@@ -1,82 +1,204 @@
-# NioStream
+# NioStream 2.0
 
-Java 17+ large-file/directory transfer over a congested TCP network.
+NioStream is a Java 17 command-line utility designed for copying large files
+and directory trees directly between two Windows SMB/UNC paths.
 
-Implemented:
-1. Automatic reconnect/retry.
-2. Resume after interruption.
-4. Multiple files/directories.
-6. Parallel transfer streams.
-7. Adaptive aggregate rate control.
-8. `java.nio.Selector` non-blocking socket I/O.
-10. Manifest + per-file bitmap state.
+It runs as ONE process on a Windows Server:
+
+    \\SOURCE-NAS\Share\Folder
+              |
+              | SMB
+              v
+       Windows Server
+          NioStream
+              |
+              | SMB
+              v
+    \\DEST-NAS\Share\Folder
+
+There is no Java sender process on the source NAS and no Java receiver process
+on the destination NAS.
+
+## Requirements
+
+- Windows Server
+- Java 17+
+- Maven 3.8+
+- Windows account with:
+  - read permission on source share
+  - modify/write permission on destination share
 
 ## Build
 
-```bash
-mvn package
-```
+From the project directory:
 
-## Receiver
+    mvn clean package
 
-```bash
-java -cp target/classes NioStream receive \
-  --port 5000 \
-  --dest D:\backup \
-  --streams 6 \
-  --chunk 4M \
-  --verify
-```
+The executable JAR is:
 
-## Sender
+    target\niostream-2.0.0.jar
 
-```bash
-java -cp target/classes NioStream send \
-  --host 192.168.1.50 \
-  --port 5000 \
-  --source D:\data\large-folder \
-  --streams 6 \
-  --chunk 4M \
-  --rate 20M \
-  --min-rate 1M \
-  --max-rate 100M \
-  --retry 2000 \
-  --retries 0 \
-  --verify
-```
+## Basic directory copy
 
-`--retries 0` means unlimited retries.
+    java -jar target\niostream-2.0.0.jar copy --source "\\NAS01\Media" --destination "\\NAS02\Backup\Media"
 
-### Named arguments
+## Recommended first test
 
-- `--host` receiver host
-- `--port` TCP port, default 5000
-- `--source` source file or directory
-- `--dest` destination directory
-- `--streams` parallel TCP streams, default 4
-- `--chunk` chunk size, default 4M
-- `--rate` initial aggregate bandwidth; `0` means use max
-- `--min-rate` adaptive lower bound
-- `--max-rate` adaptive upper bound
-- `--retry` reconnect delay in milliseconds
-- `--retries` retry count; 0 = unlimited
-- `--state` receiver resume-state directory
-- `--verify` SHA-256 chunk/file verification
-- `--keep-state` keep state after successful completion
-- `--quiet` reserved for reduced logging
+Start conservatively:
 
-Sizes accept K/M/G/T.
+    java -jar target\niostream-2.0.0.jar copy --source "\\NAS01\Media" --destination "\\NAS02\Backup\Media" --streams 4 --chunk 16M --rate 20M --min-rate 5M --max-rate 50M --resume true --verify false
 
-## Notes
+After confirming the copy works, increase the rate/streams.
 
-The receiver writes each chunk directly at its file offset, so chunks from
-parallel streams can arrive out of order. The bitmap state is persisted after
-each acknowledged chunk. Restarting the receiver therefore skips chunks
-already committed to disk.
+## Large-file / congested-network configuration
 
-The sender's adaptive controller changes the aggregate target rate based on
-observed transfer timing. `--rate`, `--min-rate`, and `--max-rate` bound that
-behavior.
+    java -jar target\niostream-2.0.0.jar copy --source "\\NAS01\Media" --destination "\\NAS02\Backup\Media" --streams 8 --chunk 32M --rate 50M --min-rate 10M --max-rate 200M --resume true --verify true
 
-For Internet/WAN deployment, put TLS/authentication around this protocol before
-using it with untrusted networks.
+## Single file
+
+The destination is treated as a directory and the source filename is retained:
+
+    java -jar target\niostream-2.0.0.jar copy --source "\\NAS01\Media\bigfile.iso" --destination "\\NAS02\Backup" --streams 4 --chunk 32M --resume true
+
+## Dry run
+
+    java -jar target\niostream-2.0.0.jar copy --source "\\NAS01\Media" --destination "\\NAS02\Backup\Media" --dry-run true
+
+## Resume
+
+The state directory defaults to:
+
+    <destination>\.niostream
+
+A state file contains a bitmap of completed chunks.
+
+If a copy is interrupted:
+
+1. Start the same command again.
+2. Existing completed chunks are skipped.
+3. Missing chunks are copied.
+4. The state file is removed after successful completion.
+
+You can put state on the local Windows Server instead:
+
+    --state "C:\ProgramData\NioStream\state"
+
+That is recommended if you don't want control/state files on the destination NAS.
+
+## Retry
+
+Unlimited retries:
+
+    --retries 0 --retry-delay 5000
+
+Five retries:
+
+    --retries 5 --retry-delay 5000
+
+Retries are at file level. Completed chunks remain in the resume bitmap.
+
+## Verification
+
+With:
+
+    --verify true
+
+NioStream calculates SHA-256 for source and destination after the file is
+copied.
+
+This provides strong end-to-end verification, but it requires another full
+read of the source and destination file. Do not enable it for every transfer
+if the NAS/network is already heavily loaded unless verification is required.
+
+## Bandwidth adaptation
+
+`--rate` establishes the starting aggregate transfer rate.
+
+Example:
+
+    --rate 50M --min-rate 10M --max-rate 100M
+
+The controller increases the target gradually when observed throughput is
+healthy and decreases it when observed throughput drops substantially.
+
+This does NOT replace Windows/SMB/TCP congestion control. It simply prevents
+NioStream from continuously adding application-level load.
+
+## Parallelism
+
+`--streams` controls the number of Java worker threads.
+
+Start with:
+
+    --streams 4
+
+Then test:
+
+    --streams 8
+
+For a network that is already congested, more workers are not necessarily
+faster. They can increase NAS queue depth and SMB contention.
+
+## Selector
+
+The previous TCP sender/receiver design used `java.nio.Selector`.
+
+That is intentionally NOT used in this version.
+
+For UNC-to-UNC copying, Java is not creating the network socket. Windows is
+providing the SMB client underneath the filesystem API. A Java Selector cannot
+control or multiplex that SMB traffic.
+
+The relevant NIO APIs here are:
+
+- Path
+- Files
+- FileChannel
+- ByteBuffer
+- FileTime
+
+## Important operational notes
+
+### Credentials
+
+Do not put SMB passwords in the Java command line.
+
+Run the Java process using a Windows account that already has access to both
+shares, or establish the appropriate Windows SMB sessions before launching
+NioStream.
+
+For Windows scheduled tasks/services, use UNC paths rather than mapped drives.
+
+### Source consistency
+
+Do not copy files while applications are actively changing them unless you
+have a snapshot/versioning mechanism.
+
+The manifest records source size and modification time when scanning begins,
+but NioStream is not a snapshot engine.
+
+### Delete-extra
+
+Do NOT enable this casually:
+
+    --delete-extra true
+
+It deletes destination files that are not in the source manifest.
+
+Use it only when the destination is intended to mirror the source.
+
+## Known design boundaries
+
+This version intentionally does not implement:
+
+- custom SMB protocol
+- custom TCP transport
+- BitTorrent-style seeding
+- NAS-side agents
+- compression
+- encryption
+- deduplication
+- file locking
+- snapshot creation
+
+The purpose is a reliable Windows Server-based UNC-to-UNC transfer engine.
