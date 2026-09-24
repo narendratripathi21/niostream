@@ -4,6 +4,7 @@ import java.net.*;
 import java.nio.*;
 import java.nio.channels.*;
 import java.nio.file.*;
+import java.nio.file.attribute.FileTime;
 import java.security.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -398,7 +399,7 @@ public class NioStream {
     }
 
     static final class Receiver {
-        final Args a; final int port, streams; final long retry; final boolean verify,quiet,keep;
+        final Args a; final int port, streams; final long retry; boolean verify; final boolean quiet,keep;
         final Path dest,stateDir;
         final ExecutorService workers;
         final Map<Integer,BitSet> done=new ConcurrentHashMap<>();
